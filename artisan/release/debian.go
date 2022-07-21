@@ -236,16 +236,12 @@ func generateBuildFunctions(bckupCmds []string) ([]byte, error) {
 	srcListBackupCmd := "bash -c 'sudo mv /etc/apt/sources.list /etc/apt/sources.list.bkp'"
 	revertSrcList := "sudo mv /etc/apt/sources.list.bkp /etc/apt/sources.list"
 	revertSrcListCmd := fmt.Sprintf("bash -c '%s'", revertSrcList)
-	//newSrcList := "sudo echo \"deb [trusted=yes] file:$((pwd))/patch ./\" | sudo tee /etc/apt/sources.list"
 	newSrcList := "sudo echo \"deb [trusted=yes] file:/tmp/patch ./\" | sudo tee /etc/apt/sources.list"
 	newSrcListCombinedCmd := fmt.Sprintf("bash -c '%s || %s'", newSrcList, revertSrcList)
 	patchCmd := "sudo apt-get update && sudo  DEBIAN_FRONTEND=noninteractive apt-get -qy -o \"Dpkg::Options::=--force-confdef\" -o \"Dpkg::Options::=--force-confold\" upgrade -y"
 	combinedPatchCmd := fmt.Sprintf("bash -c '%s || %s'", patchCmd, revertSrcList)
 
 	bf := data.BuildFile{
-		Env: map[string]string{
-			"CVE_REPORT_PATH": "~/.config/piloth/cron/cve",
-		},
 		Runtime: "ubi-min",
 		Functions: []*data.Function{
 			{
@@ -260,7 +256,6 @@ func generateBuildFunctions(bckupCmds []string) ([]byte, error) {
 					newSrcListCombinedCmd,
 					combinedPatchCmd,
 					revertSrcListCmd,
-					"art util stamp -p ${CVE_REPORT_PATH}/.patch_date",
 				},
 			},
 			{
