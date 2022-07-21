@@ -233,12 +233,19 @@ func aptPkgName() string {
 func generateBuildFunctions(bckupCmds []string) ([]byte, error) {
 	export_yes := true
 	export_no := false
-	patchCmd := "(cd patch && echo \"\" && echo \"************ patching started ***************\"" +
-		" && sudo DEBIAN_FRONTEND=noninteractive dpkg --force-all -i * && echo \"************ patch completed ***************\" && echo \"\")"
-	rollbackCmd := "(cd backup && echo \"\" && echo \"************ patching failed, rollback started ***************\"" +
-		" && sudo DEBIAN_FRONTEND=noninteractive dpkg --force-all -i * && echo \"************ rollback completed ***************\" && echo \"\")"
-	combinedCmd := "bash -c '" + patchCmd + " || " + rollbackCmd + "'"
+	srcListBackupCmd := "bash -c 'sudo mv /etc/apt/sources.list /etc/apt/sources.list.bkp'"
+	revertSrcList := "sudo mv /etc/apt/sources.list.bkp /etc/apt/sources.list"
+	revertSrcListCmd := fmt.Sprintf("bash -c '%s'", revertSrcList)
+	//newSrcList := "sudo echo \"deb [trusted=yes] file:$((pwd))/patch ./\" | sudo tee /etc/apt/sources.list"
+	newSrcList := "sudo echo \"deb [trusted=yes] file:/tmp/patch ./\" | sudo tee /etc/apt/sources.list"
+	newSrcListCombinedCmd := fmt.Sprintf("bash -c '%s || %s'", newSrcList, revertSrcList)
+	patchCmd := "sudo apt-get update && sudo  DEBIAN_FRONTEND=noninteractive apt-get -qy -o \"Dpkg::Options::=--force-confdef\" -o \"Dpkg::Options::=--force-confold\" upgrade -y"
+	combinedPatchCmd := fmt.Sprintf("bash -c '%s || %s'", patchCmd, revertSrcList)
+
 	bf := data.BuildFile{
+		Env: map[string]string{
+			"CVE_REPORT_PATH": "~/.config/piloth/cron/cve",
+		},
 		Runtime: "ubi-min",
 		Functions: []*data.Function{
 			{
@@ -246,9 +253,14 @@ func generateBuildFunctions(bckupCmds []string) ([]byte, error) {
 				Description: "apply debian packages to the operating system. In case of failure, will automatically rollback",
 				Export:      &export_yes,
 				Run: []string{
-					"bash -c 'mkdir -p backup'",
-					"$(backup)",
-					combinedCmd,
+					"bash -c 'rm -rf /tmp/patch'",
+					"bash -c 'mkdir -p /tmp/patch && chmod 755 /tmp/patch'",
+					"bash -c 'cp -r patch/. /tmp/patch/ && chmod 644 /tmp/patch/*'",
+					srcListBackupCmd,
+					newSrcListCombinedCmd,
+					combinedPatchCmd,
+					revertSrcListCmd,
+					"art util stamp -p ${CVE_REPORT_PATH}/.patch_date",
 				},
 			},
 			{
@@ -355,4 +367,17 @@ func dedup(dep string) (string, error) {
 		b.WriteString(" ")
 	}
 	return strings.TrimSpace(b.String()), nil
+}
+
+func buildMetadata(patchFolder string) error {
+	cmd := "bash -c 'dpkg-scanpackages . /dev/null > Release'"
+	_, er := build.Exe(cmd, patchFolder, merge.NewEnVarFromSlice([]string{}), false)
+	if er != nil {
+		return er
+	}
+
+	cmd = "bash -c 'dpkg-scanpackages . /dev/null | gzip -9c > Packages.gz'"
+	_, er = build.Exe(cmd, patchFolder, merge.NewEnVarFromSlice([]string{}), false)
+
+	return er
 }
