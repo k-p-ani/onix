@@ -36,7 +36,7 @@ type Builder struct {
 	commit           string
 	from             string
 	RepoName         *core.PackageName
-	buildFile        *data.BuildFile
+	buildFile        *data.BuildFile // the build file for building the package
 	localReg         *registry.LocalRegistry
 	shouldCopySource bool
 	loadFrom         string
@@ -65,18 +65,17 @@ func NewBuilder(artHome string) *Builder {
 // copy: indicates whether a copy should be made of the project files before packaging (only valid for from location in the file system)
 // interactive: true if the console should survey for missing variables
 // target: a specific target without relying on a build file (can be either relative or absolute)
-func (b *Builder) Build(from, fromPath, gitToken string, name *core.PackageName, profileName string, copy bool, interactive bool, target string) {
-	// if we have a target then turn it into absolute path
-	if len(target) > 0 {
-		target, _ = filepath.Abs(target)
-	}
+func (b *Builder) Build(from, fromPath, gitToken string, name *core.PackageName, profileName string, copy bool, interactive bool, target string) error {
 	b.from = from
 	// prepare the source ready for the build
 	repo := b.prepareSource(from, fromPath, gitToken, name, copy, target)
 	// set the unique identifier name for both the zip file and the seal file
 	b.setUniqueIdName(repo)
 	// run commands
-	buildProfile := b.runProfile(profileName, b.loadFrom, interactive)
+	buildProfile, err := b.runProfile(profileName, b.loadFrom, interactive)
+	if err != nil {
+		return err
+	}
 	// merge env with target
 	mergedTarget, _ := core.MergeEnvironmentVars([]string{buildProfile.Target}, b.env.Vars, interactive)
 	// set the merged target for later use
@@ -88,25 +87,31 @@ func (b *Builder) Build(from, fromPath, gitToken string, name *core.PackageName,
 		workingTarget = filepath.Join(b.loadFrom, workingTarget)
 	}
 	waitForTargetToBeCreated(workingTarget)
-	// compress the target defined in the build.yaml' profile
+	// compress the target defined in the build.yaml profile
 	core.Debug("zipping target path '%s'\n", workingTarget)
 	b.zipPackage(workingTarget)
 	// creates a seal
 	core.Debug("creating package seal\n")
 	s, err := b.createSeal(buildProfile)
-	core.CheckErr(err, "cannot create package seal")
+	if err != nil {
+		return fmt.Errorf("cannot create package seal")
+	}
 	// save the seal
-	core.CheckErr(ioutil.WriteFile(b.workDirJsonFilename(), core.ToJsonBytes(s), os.ModePerm), "failed to write package seal file")
+	err = ioutil.WriteFile(b.workDirJsonFilename(), core.ToJsonBytes(s), os.ModePerm)
+	if err != nil {
+		return fmt.Errorf("failed to write package seal file")
+	}
 	// add the package to the local repo
 	core.Debug("adding package to local registry\n")
 	b.localReg.Add(b.WorkDirPackageFilename(), b.RepoName, s)
 	// cleanup all relevant folders and move package to target location
 	core.Debug("performing cleanup\n")
 	b.cleanUp()
+	return nil
 }
 
 // Run execute the specified function
-func (b *Builder) Run(function string, path string, interactive bool, env *merge.Envar) {
+func (b *Builder) Run(function string, path string, interactive bool, env *merge.Envar) error {
 	// if no path is specified use .
 	if len(path) == 0 {
 		path = "."
@@ -114,24 +119,26 @@ func (b *Builder) Run(function string, path string, interactive bool, env *merge
 	var localPath = path
 	// if a relative path is passed
 	if strings.HasPrefix(path, "http") {
-		core.RaiseErr("the path must not be an http resource")
+		return fmt.Errorf("the path must not be an http resource")
 	}
 	if strings.HasPrefix(path, "./") || strings.HasPrefix(path, "../") || (!strings.HasPrefix(path, "/")) {
 		// turn it into an absolute path
 		absPath, err := filepath.Abs(path)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		localPath = absPath
 	}
 	bf, err := data.LoadBuildFile(filepath.Join(localPath, "build.yaml"))
-	core.CheckErr(err, "cannot load build file")
+	if err != nil {
+		return fmt.Errorf("cannot load build file")
+	}
 	b.buildFile = bf
-	b.runFunction(function, localPath, interactive, env)
+	return b.runFunction(function, localPath, interactive, env)
 }
 
 // either clone a remote git repo or copy a local one onto the source folder
-func (b *Builder) prepareSource(from string, fromPath string, gitToken string, tagName *core.PackageName, copy bool, target string) *git.Repository {
+func (b *Builder) prepareSource(from string, fromPath string, gitToken string, tagName *core.PackageName, copy bool, targetFromFlag string) *git.Repository {
 	var repo *git.Repository
 	b.RepoName = tagName
 	// creates a temporary working directory
@@ -187,35 +194,35 @@ func (b *Builder) prepareSource(from string, fromPath string, gitToken string, t
 		repo = b.openRepo(localPath)
 	}
 	var (
-		bf  *data.BuildFile
-		err error
+		targetBf *data.BuildFile
+		err      error
 	)
-	if len(target) == 0 {
+	// if a specific target has not been set via flag, this is the case of a target being specified in the build file
+	if len(targetFromFlag) == 0 {
 		buildFilePath := filepath.Join(b.loadFrom, "build.yaml")
 		core.Debug("loading build file from %s\n", buildFilePath)
-		bf, err = data.LoadBuildFile(buildFilePath)
-		core.CheckErr(err, "no build file found at %s and no --target flag has been specified", buildFilePath)
+		targetBf, err = data.LoadBuildFile(buildFilePath)
+		core.CheckErr(err, "failed to get target build file")
+		b.buildFile = targetBf
 	} else {
-		// check that a build file exist in the target
-		buildFilePath := filepath.Join(target, "build.yaml")
-		core.Debug("loading build file from %s\n", target)
-		bf, err = data.LoadBuildFile(buildFilePath)
-		if err != nil {
-			core.WarningLogger.Printf("no build file found at target %s, building a content only package\n", target)
-			// dynamically creates one that packages anything on the build target
-			bf = &data.BuildFile{
-				Profiles: []*data.Profile{
-					{
-						Name:    "content-only",
-						Default: true,
-						Target:  target,
-						Type:    "content/file",
-					},
+		// there is no build file as the target has been set via flag, so it creates one dynamically for the builder to work
+		core.WarningLogger.Printf("no build file found at target %s, building a content only package\n", targetFromFlag)
+		// dynamically creates one that packages anything on the build target
+		bf := &data.BuildFile{
+			Profiles: []*data.Profile{
+				{
+					Name:    "content-only",
+					Default: true,
+					Target:  targetFromFlag,
+					Type:    "content/file",
 				},
-			}
+			},
 		}
+		if ok, validationErr := bf.Validate(); !ok {
+			core.RaiseErr(validationErr.Error())
+		}
+		b.buildFile = bf
 	}
-	b.buildFile = bf
 	return repo
 }
 
@@ -345,7 +352,7 @@ func (b *Builder) getIgnored() []string {
 }
 
 // run a specified function
-func (b *Builder) runFunction(function string, path string, interactive bool, env *merge.Envar) {
+func (b *Builder) runFunction(function string, path string, interactive bool, env *merge.Envar) error {
 	// if in debug mode, print environment variables
 	env.Debug(fmt.Sprintf("executing function: %s\n", function))
 	// if inputs are defined for the function then survey for data
@@ -355,8 +362,7 @@ func (b *Builder) runFunction(function string, path string, interactive bool, en
 	// gets the function to run
 	fx := b.buildFile.Fx(function)
 	if fx == nil {
-		core.RaiseErr("function %s does not exist in the build file", function)
-		return
+		return fmt.Errorf("function %s does not exist in the build file", function)
 	}
 	// set the unique name for the run
 	b.setUniqueIdName(b.openRepo(path))
@@ -380,36 +386,49 @@ func (b *Builder) runFunction(function string, path string, interactive bool, en
 		// if the statement has a function call
 		if ok, expr, shell := core.HasShell(cmd); ok {
 			out, err := Exe(shell, path, buildEnv, interactive)
-			core.CheckErr(err, "cannot execute subshell command: %s", cmd)
+			if err != nil {
+				return fmt.Errorf("cannot execute subshell command: %s", cmd)
+			}
 			// ensure the subshell output does not end with newline
 			out = core.TrimNewline(out)
 			// merges the output of the subshell in the original command
 			cmd = strings.Replace(cmd, expr, out, -1)
 			// execute the statement
 			err = execute(cmd, path, buildEnv, interactive)
-			core.CheckErr(err, "cannot execute command: %s", cmd)
-		} else if ok, fx := core.HasFunction(cmd); ok {
+			if err != nil {
+				return fmt.Errorf("cannot execute command: %s", cmd)
+			}
+		} else if hasFx, fxName := core.HasFunction(cmd); hasFx {
 			// executes the function
-			b.runFunction(fx, path, interactive, env)
+			runErr := b.runFunction(fxName, path, interactive, env)
+			if runErr != nil {
+				return runErr
+			}
 		} else {
 			// execute the statement
 			err := execute(cmd, path, buildEnv, interactive)
-			core.CheckErr(err, "cannot execute command: %s", cmd)
+			if err != nil {
+				return fmt.Errorf("cannot execute command: %s", cmd)
+			}
 		}
 	}
+	return nil
 }
 
 // execute all commands in the specified profile
 // if not profile is specified, it uses the default profile
 // if a default profile has not been defined, then uses the first profile in the build file
 // returns the profile used
-func (b *Builder) runProfile(profileName string, execDir string, interactive bool) *data.Profile {
+func (b *Builder) runProfile(profileName string, execDir string, interactive bool) (*data.Profile, error) {
 	// construct an environment with the vars at build file level
 	env := merge.NewEnVarFromSlice(os.Environ())
 	// get the build file environment and merge any subshell command
 	vars := b.evalSubshell(b.buildFile.GetEnv(), execDir, env, interactive)
 	// add the merged vars to the env
 	env = env.Append(vars)
+	if b.buildFile.Profiles == nil {
+		core.RaiseErr("cannot build without at least one profile in the build file")
+	}
 	// for each build profile
 	for _, profile := range b.buildFile.Profiles {
 		// if a profile name has been provided then build it
@@ -438,15 +457,20 @@ func (b *Builder) runProfile(profileName string, execDir string, interactive boo
 					core.CheckErr(err, "cannot execute command: %s", cmd)
 				} else if ok, fx := core.HasFunction(cmd); ok {
 					// executes the function
-					b.runFunction(fx, execDir, interactive, env)
+					err := b.runFunction(fx, execDir, interactive, env)
+					if err != nil {
+						return nil, err
+					}
 				} else {
 					// execute the statement
 					core.Debug("executing profile command: %s; @ %s\n", cmd, execDir)
 					err := execute(cmd, execDir, buildEnv, interactive)
-					core.CheckErr(err, "cannot execute command: %s", cmd)
+					if err != nil {
+						return nil, fmt.Errorf("cannot execute command: %s", cmd)
+					}
 				}
 			}
-			return profile
+			return profile, nil
 		}
 		// if the profile has not been provided
 		if len(profileName) == 0 {
@@ -465,8 +489,7 @@ func (b *Builder) runProfile(profileName string, execDir string, interactive boo
 	}
 	// if we got to this point then a specific profile was requested but not defined
 	// so cannot continue
-	core.RaiseErr("the requested profile '%s' is not defined in Artisan's build configuration", profileName)
-	return nil
+	return nil, fmt.Errorf("the requested profile '%s' is not defined in Artisan's build configuration", profileName)
 }
 
 // evaluate sub-shells and replace their values in the variables
@@ -532,6 +555,12 @@ func (b *Builder) createSeal(profile *data.Profile) (*data.Seal, error) {
 		Time:    time.Now().Format(time.RFC850),
 		Size:    bytesToLabel(zipInfo.Size()),
 	}
+	if profile.X != nil {
+		info.X = profile.X
+	}
+	if profile.Network != nil {
+		info.Network = profile.Network
+	}
 	// take the hash of the zip file and seal info combined
 	s := new(data.Seal)
 	// the seal needs the manifest to create a checksum
@@ -581,12 +610,16 @@ func (b *Builder) createSeal(profile *data.Profile) (*data.Seal, error) {
 		if fx.Export != nil && *fx.Export {
 			core.Debug("adding inputs to the manifest for exported function '%s'\n", fx.Name)
 			// then grab the required inputs
-			s.Manifest.Functions = append(s.Manifest.Functions, &data.FxInfo{
+			f := &data.FxInfo{
 				Name:        fx.Name,
 				Description: fx.Description,
 				Input:       data.SurveyInputFromBuildFile(fx.Name, buildFile, false, true, merge.NewEnVarFromSlice(os.Environ()), b.artHome),
 				Runtime:     fx.Runtime,
-			})
+			}
+			if fx.Credits > 0 {
+				f.Credits = fx.Credits
+			}
+			s.Manifest.Functions = append(s.Manifest.Functions, f)
 		}
 	}
 	err = b.sProc(b, s)
@@ -663,7 +696,10 @@ func (b *Builder) Execute(name *core.PackageName, function string, credentials s
 	// check the function is exported
 	if isExported(m, function) {
 		// run the function on the open package
-		b.Run(function, path, interactive, env)
+		err := b.Run(function, path, interactive, env)
+		if err != nil {
+			return err
+		}
 		// if there is no instruction to preserve the open files
 		if !preserveFiles {
 			// remove the package files

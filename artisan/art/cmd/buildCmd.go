@@ -109,6 +109,7 @@ Use the --image flag to specify which image to package as follows:
 	c.Cmd.Flags().StringVarP(&c.profile, "profile", "p", "", "the build profile to use. if not provided, the default profile defined in the build file is used. if no default profile is found, then the first profile in the build file is used.")
 	c.Cmd.Flags().BoolVarP(&c.interactive, "interactive", "i", false, "if true, it prompts the user for information if not provided")
 	c.Cmd.Flags().BoolVarP(&c.copySource, "copy", "c", false, "indicates if a copy should be made of the project files before building the package. it is only applicable if the source is in the file system.")
+	c.Cmd.MarkFlagRequired("package-name")
 	return c
 }
 
@@ -129,6 +130,6 @@ func (b *BuildCmd) Run(_ *cobra.Command, args []string) {
 	if len(b.image) > 0 {
 		core.CheckErr(release.BuildImagePackage(b.image, b.packageName, "", "", ""), "cannot build image package")
 	} else {
-		builder.Build(b.from, b.fromPath, b.gitToken, name, b.profile, b.copySource, b.interactive, b.target)
+		core.CheckErr(builder.Build(b.from, b.fromPath, b.gitToken, name, b.profile, b.copySource, b.interactive, b.target), "cannot build package")
 	}
 }
